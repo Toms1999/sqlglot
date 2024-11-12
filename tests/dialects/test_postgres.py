@@ -51,7 +51,6 @@ class TestPostgres(Validator):
         self.validate_identity("x$")
         self.validate_identity("SELECT ARRAY[1, 2, 3]")
         self.validate_identity("SELECT ARRAY(SELECT 1)")
-        self.validate_identity("SELECT ARRAY_LENGTH(ARRAY[1, 2, 3], 1)")
         self.validate_identity("STRING_AGG(x, y)")
         self.validate_identity("STRING_AGG(x, ',' ORDER BY y)")
         self.validate_identity("STRING_AGG(x, ',' ORDER BY y DESC)")
@@ -354,10 +353,10 @@ class TestPostgres(Validator):
         self.validate_all(
             "SELECT ARRAY[1, 2, 3] @> ARRAY[1, 2]",
             read={
-                "duckdb": "SELECT ARRAY_HAS_ALL([1, 2, 3], [1, 2])",
+                "duckdb": "SELECT [1, 2, 3] @> [1, 2]",
             },
             write={
-                "duckdb": "SELECT ARRAY_HAS_ALL([1, 2, 3], [1, 2])",
+                "duckdb": "SELECT [1, 2, 3] @> [1, 2]",
                 "mysql": UnsupportedError,
                 "postgres": "SELECT ARRAY[1, 2, 3] @> ARRAY[1, 2]",
             },
@@ -396,13 +395,6 @@ class TestPostgres(Validator):
             write={
                 "duckdb": """SELECT (data ->> '$."en-US"') AS acat FROM my_table""",
                 "postgres": "SELECT (data ->> 'en-US') AS acat FROM my_table",
-            },
-        )
-        self.validate_all(
-            "SELECT ARRAY[1, 2, 3] && ARRAY[1, 2]",
-            write={
-                "": "SELECT ARRAY_OVERLAPS(ARRAY(1, 2, 3), ARRAY(1, 2))",
-                "postgres": "SELECT ARRAY[1, 2, 3] && ARRAY[1, 2]",
             },
         )
         self.validate_all(
@@ -690,6 +682,11 @@ class TestPostgres(Validator):
             """SELECT TRIM(TRAILING ' XXX ' COLLATE "de_DE")""",
             """SELECT RTRIM(' XXX ' COLLATE "de_DE")""",
         )
+        self.validate_identity("LEVENSHTEIN(col1, col2)")
+        self.validate_identity("LEVENSHTEIN_LESS_EQUAL(col1, col2, 1)")
+        self.validate_identity("LEVENSHTEIN(col1, col2, 1, 2, 3)")
+        self.validate_identity("LEVENSHTEIN_LESS_EQUAL(col1, col2, 1, 2, 3, 4)")
+
         self.validate_all(
             """'{"a":1,"b":2}'::json->'b'""",
             write={
@@ -794,6 +791,33 @@ class TestPostgres(Validator):
         self.validate_identity(
             'SELECT js, js IS JSON ARRAY WITH UNIQUE KEYS AS "array w. UK?", js IS JSON ARRAY WITHOUT UNIQUE KEYS AS "array w/o UK?", js IS JSON ARRAY UNIQUE KEYS AS "array w UK 2?" FROM t'
         )
+        self.validate_identity(
+            "MERGE INTO target_table USING source_table AS source ON target.id = source.id WHEN MATCHED THEN DO NOTHING WHEN NOT MATCHED THEN DO NOTHING RETURNING MERGE_ACTION(), *"
+        )
+        self.validate_identity(
+            "SELECT 1 FROM ((VALUES (1)) AS vals(id) LEFT OUTER JOIN tbl ON vals.id = tbl.id)"
+        )
+        self.validate_identity("SELECT OVERLAY(a PLACING b FROM 1)")
+        self.validate_identity("SELECT OVERLAY(a PLACING b FROM 1 FOR 1)")
+        self.validate_identity("ARRAY[1, 2, 3] && ARRAY[1, 2]").assert_is(exp.ArrayOverlaps)
+
+        self.validate_all(
+            """SELECT JSONB_EXISTS('{"a": [1,2,3]}', 'a')""",
+            write={
+                "postgres": """SELECT JSONB_EXISTS('{"a": [1,2,3]}', 'a')""",
+                "duckdb": """SELECT JSON_EXISTS('{"a": [1,2,3]}', '$.a')""",
+            },
+        )
+        self.validate_all(
+            "WITH t AS (SELECT ARRAY[1, 2, 3] AS col) SELECT * FROM t WHERE 1 <= ANY(col) AND 2 = ANY(col)",
+            write={
+                "postgres": "WITH t AS (SELECT ARRAY[1, 2, 3] AS col) SELECT * FROM t WHERE 1 <= ANY(col) AND 2 = ANY(col)",
+                "hive": "WITH t AS (SELECT ARRAY(1, 2, 3) AS col) SELECT * FROM t WHERE EXISTS(col, x -> 1 <= x) AND EXISTS(col, x -> 2 = x)",
+                "spark2": "WITH t AS (SELECT ARRAY(1, 2, 3) AS col) SELECT * FROM t WHERE EXISTS(col, x -> 1 <= x) AND EXISTS(col, x -> 2 = x)",
+                "spark": "WITH t AS (SELECT ARRAY(1, 2, 3) AS col) SELECT * FROM t WHERE EXISTS(col, x -> 1 <= x) AND EXISTS(col, x -> 2 = x)",
+                "databricks": "WITH t AS (SELECT ARRAY(1, 2, 3) AS col) SELECT * FROM t WHERE EXISTS(col, x -> 1 <= x) AND EXISTS(col, x -> 2 = x)",
+            },
+        )
 
     def test_ddl(self):
         # Checks that user-defined types are parsed into DataType instead of Identifier
@@ -811,6 +835,7 @@ class TestPostgres(Validator):
         cdef.args["kind"].assert_is(exp.DataType)
         self.assertEqual(expr.sql(dialect="postgres"), "CREATE TABLE t (x INTERVAL DAY)")
 
+        self.validate_identity('ALTER INDEX "IX_Ratings_Column1" RENAME TO "IX_Ratings_Column2"')
         self.validate_identity('CREATE TABLE x (a TEXT COLLATE "de_DE")')
         self.validate_identity('CREATE TABLE x (a TEXT COLLATE pg_catalog."default")')
         self.validate_identity("CREATE TABLE t (col INT[3][5])")
@@ -845,6 +870,9 @@ class TestPostgres(Validator):
         self.validate_identity("ALTER TABLE t1 SET ACCESS METHOD method")
         self.validate_identity("ALTER TABLE t1 SET TABLESPACE tablespace")
         self.validate_identity("ALTER TABLE t1 SET (fillfactor = 5, autovacuum_enabled = TRUE)")
+        self.validate_identity(
+            "ALTER TABLE tested_table ADD CONSTRAINT unique_example UNIQUE (column_name) NOT VALID"
+        )
         self.validate_identity(
             "CREATE FUNCTION pymax(a INT, b INT) RETURNS INT LANGUAGE plpython3u AS $$\n  if a > b:\n    return a\n  return b\n$$",
         )
@@ -1023,6 +1051,10 @@ class TestPostgres(Validator):
         self.validate_identity(
             "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_table_id ON tbl USING btree(id)"
         )
+        self.validate_identity("DROP INDEX ix_table_id")
+        self.validate_identity("DROP INDEX IF EXISTS ix_table_id")
+        self.validate_identity("DROP INDEX CONCURRENTLY ix_table_id")
+        self.validate_identity("DROP INDEX CONCURRENTLY IF EXISTS ix_table_id")
 
         self.validate_identity(
             """
@@ -1208,4 +1240,50 @@ CROSS JOIN JSON_ARRAY_ELEMENTS(CAST(JSON_EXTRACT_PATH(tbox, 'boxes') AS JSON)) A
         )
         self.validate_identity(
             """SELECT * FROM table1, ROWS FROM (FUNC1(col1) AS alias1("col1" TEXT)) WITH ORDINALITY AS alias3("col3" INT, "col4" TEXT)"""
+        )
+
+    def test_array_length(self):
+        self.validate_identity("SELECT ARRAY_LENGTH(ARRAY[1, 2, 3], 1)")
+
+        self.validate_all(
+            "ARRAY_LENGTH(arr, 1)",
+            read={
+                "bigquery": "ARRAY_LENGTH(arr)",
+                "duckdb": "ARRAY_LENGTH(arr)",
+                "presto": "CARDINALITY(arr)",
+                "drill": "REPEATED_COUNT(arr)",
+                "teradata": "CARDINALITY(arr)",
+                "hive": "SIZE(arr)",
+                "spark2": "SIZE(arr)",
+                "spark": "SIZE(arr)",
+                "databricks": "SIZE(arr)",
+            },
+            write={
+                "duckdb": "ARRAY_LENGTH(arr, 1)",
+                "presto": "CARDINALITY(arr)",
+                "teradata": "CARDINALITY(arr)",
+                "bigquery": "ARRAY_LENGTH(arr)",
+                "drill": "REPEATED_COUNT(arr)",
+                "clickhouse": "LENGTH(arr)",
+                "hive": "SIZE(arr)",
+                "spark2": "SIZE(arr)",
+                "spark": "SIZE(arr)",
+                "databricks": "SIZE(arr)",
+            },
+        )
+
+        self.validate_all(
+            "ARRAY_LENGTH(arr, foo)",
+            write={
+                "duckdb": "ARRAY_LENGTH(arr, foo)",
+                "hive": UnsupportedError,
+                "spark2": UnsupportedError,
+                "spark": UnsupportedError,
+                "databricks": UnsupportedError,
+                "presto": UnsupportedError,
+                "teradata": UnsupportedError,
+                "bigquery": UnsupportedError,
+                "drill": UnsupportedError,
+                "clickhouse": UnsupportedError,
+            },
         )

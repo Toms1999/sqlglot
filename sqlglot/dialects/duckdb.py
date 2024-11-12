@@ -25,7 +25,6 @@ from sqlglot.dialects.dialect import (
     no_time_sql,
     no_timestamp_sql,
     pivot_column_names,
-    regexp_extract_sql,
     rename_func,
     str_position_sql,
     str_to_time_sql,
@@ -34,9 +33,13 @@ from sqlglot.dialects.dialect import (
     unit_to_var,
     unit_to_str,
     sha256_sql,
+    build_regexp_extract,
+    explode_to_unnest_sql,
 )
+from sqlglot.generator import unsupported_args
 from sqlglot.helper import seq_get
 from sqlglot.tokens import TokenType
+from sqlglot.parser import binary_range_parser
 
 DATETIME_DELTA = t.Union[
     exp.DateAdd, exp.TimeAdd, exp.DatetimeAdd, exp.TsOrDsAdd, exp.DateSub, exp.DatetimeSub
@@ -101,9 +104,8 @@ def _timediff_sql(self: DuckDB.Generator, expression: exp.TimeDiff) -> str:
     return self.func("DATE_DIFF", unit_to_str(expression), expr, this)
 
 
+@unsupported_args(("expression", "DuckDB's ARRAY_SORT does not support a comparator."))
 def _array_sort_sql(self: DuckDB.Generator, expression: exp.ArraySort) -> str:
-    if expression.expression:
-        self.unsupported("DuckDB ARRAY_SORT does not support a comparator")
     return self.func("ARRAY_SORT", expression.this)
 
 
@@ -154,18 +156,24 @@ def _struct_sql(self: DuckDB.Generator, expression: exp.Struct) -> str:
 
     # BigQuery allows inline construction such as "STRUCT<a STRING, b INTEGER>('str', 1)" which is
     # canonicalized to "ROW('str', 1) AS STRUCT(a TEXT, b INT)" in DuckDB
-    # The transformation to ROW will take place if a cast to STRUCT / ARRAY of STRUCTs is found
+    # The transformation to ROW will take place if:
+    #  1. The STRUCT itself does not have proper fields (key := value) as a "proper" STRUCT would
+    #  2. A cast to STRUCT / ARRAY of STRUCTs is found
     ancestor_cast = expression.find_ancestor(exp.Cast)
-    is_struct_cast = ancestor_cast and any(
-        casted_type.is_type(exp.DataType.Type.STRUCT)
-        for casted_type in ancestor_cast.find_all(exp.DataType)
+    is_bq_inline_struct = (
+        (expression.find(exp.PropertyEQ) is None)
+        and ancestor_cast
+        and any(
+            casted_type.is_type(exp.DataType.Type.STRUCT)
+            for casted_type in ancestor_cast.find_all(exp.DataType)
+        )
     )
 
     for i, expr in enumerate(expression.expressions):
         is_property_eq = isinstance(expr, exp.PropertyEQ)
         value = expr.expression if is_property_eq else expr
 
-        if is_struct_cast:
+        if is_bq_inline_struct:
             args.append(self.sql(value))
         else:
             key = expr.name if is_property_eq else f"_{i}"
@@ -173,7 +181,7 @@ def _struct_sql(self: DuckDB.Generator, expression: exp.Struct) -> str:
 
     csv_args = ", ".join(args)
 
-    return f"ROW({csv_args})" if is_struct_cast else f"{{{csv_args}}}"
+    return f"ROW({csv_args})" if is_bq_inline_struct else f"{{{csv_args}}}"
 
 
 def _datatype_sql(self: DuckDB.Generator, expression: exp.DataType) -> str:
@@ -255,6 +263,14 @@ def _generate_datetime_array_sql(
     return self.sql(gen_series)
 
 
+def _json_extract_value_array_sql(
+    self: DuckDB.Generator, expression: exp.JSONValueArray | exp.JSONExtractArray
+) -> str:
+    json_extract = exp.JSONExtract(this=expression.this, expression=expression.expression)
+    data_type = "ARRAY<STRING>" if isinstance(expression, exp.JSONValueArray) else "ARRAY<JSON>"
+    return self.sql(exp.cast(json_extract, to=exp.DataType.build(data_type)))
+
+
 class DuckDB(Dialect):
     NULL_ORDERING = "nulls_are_last"
     SUPPORTS_USER_DEFINED_TYPES = False
@@ -263,6 +279,7 @@ class DuckDB(Dialect):
     CONCAT_COALESCE = True
     SUPPORTS_ORDER_BY_ALL = True
     SUPPORTS_FIXED_SIZE_ARRAYS = True
+    STRICT_JSON_PATH_SYNTAX = False
 
     # https://duckdb.org/docs/sql/introduction.html#creating-a-new-table
     NORMALIZATION_STRATEGY = NormalizationStrategy.CASE_INSENSITIVE
@@ -288,6 +305,10 @@ class DuckDB(Dialect):
         KEYWORDS = {
             **tokens.Tokenizer.KEYWORDS,
             "//": TokenType.DIV,
+            "**": TokenType.DSTAR,
+            "^@": TokenType.CARET_AT,
+            "@>": TokenType.AT_GT,
+            "<@": TokenType.LT_AT,
             "ATTACH": TokenType.COMMAND,
             "BINARY": TokenType.VARBINARY,
             "BITSTRING": TokenType.BIT,
@@ -324,6 +345,19 @@ class DuckDB(Dialect):
             **parser.Parser.BITWISE,
             TokenType.TILDA: exp.RegexpLike,
         }
+        BITWISE.pop(TokenType.CARET)
+
+        RANGE_PARSERS = {
+            **parser.Parser.RANGE_PARSERS,
+            TokenType.DAMP: binary_range_parser(exp.ArrayOverlaps),
+            TokenType.CARET_AT: binary_range_parser(exp.StartsWith),
+        }
+
+        EXPONENT = {
+            **parser.Parser.EXPONENT,
+            TokenType.CARET: exp.Pow,
+            TokenType.DSTAR: exp.Pow,
+        }
 
         FUNCTIONS_WITH_ALIASED_ARGS = {*parser.Parser.FUNCTIONS_WITH_ALIASED_ARGS, "STRUCT_PACK"}
 
@@ -354,14 +388,10 @@ class DuckDB(Dialect):
             "LIST_VALUE": lambda args: exp.Array(expressions=args),
             "MAKE_TIME": exp.TimeFromParts.from_arg_list,
             "MAKE_TIMESTAMP": _build_make_timestamp,
-            "MEDIAN": lambda args: exp.PercentileCont(
-                this=seq_get(args, 0), expression=exp.Literal.number(0.5)
-            ),
             "QUANTILE_CONT": exp.PercentileCont.from_arg_list,
             "QUANTILE_DISC": exp.PercentileDisc.from_arg_list,
-            "REGEXP_EXTRACT": lambda args: exp.RegexpExtract(
-                this=seq_get(args, 0), expression=seq_get(args, 1), group=seq_get(args, 2)
-            ),
+            "REGEXP_EXTRACT": build_regexp_extract(exp.RegexpExtract),
+            "REGEXP_EXTRACT_ALL": build_regexp_extract(exp.RegexpExtractAll),
             "REGEXP_MATCHES": exp.RegexpLike.from_arg_list,
             "REGEXP_REPLACE": lambda args: exp.RegexpReplace(
                 this=seq_get(args, 0),
@@ -382,6 +412,7 @@ class DuckDB(Dialect):
             "XOR": binary_from_function(exp.BitwiseXor),
             "GENERATE_SERIES": _build_generate_series(),
             "RANGE": _build_generate_series(end_exclusive=True),
+            "EDITDIST3": exp.Levenshtein.from_arg_list,
         }
 
         FUNCTIONS.pop("DATE_SUB")
@@ -476,14 +507,13 @@ class DuckDB(Dialect):
         STAR_EXCEPT = "EXCLUDE"
         PAD_FILL_PATTERN_IS_REQUIRED = True
         ARRAY_CONCAT_IS_VAR_LEN = False
+        ARRAY_SIZE_DIM_REQUIRED = False
 
         TRANSFORMS = {
             **generator.Generator.TRANSFORMS,
             exp.ApproxDistinct: approx_count_distinct_sql,
             exp.Array: inline_array_unless_query,
-            exp.ArrayContainsAll: rename_func("ARRAY_HAS_ALL"),
             exp.ArrayFilter: rename_func("LIST_FILTER"),
-            exp.ArraySize: rename_func("ARRAY_LENGTH"),
             exp.ArgMax: arg_max_or_min_no_count("ARG_MAX"),
             exp.ArgMin: arg_max_or_min_no_count("ARG_MIN"),
             exp.ArraySort: _array_sort_sql,
@@ -495,6 +525,7 @@ class DuckDB(Dialect):
             exp.CurrentTimestamp: lambda *_: "CURRENT_TIMESTAMP",
             exp.DayOfMonth: rename_func("DAYOFMONTH"),
             exp.DayOfWeek: rename_func("DAYOFWEEK"),
+            exp.DayOfWeekIso: rename_func("ISODOW"),
             exp.DayOfYear: rename_func("DAYOFYEAR"),
             exp.DataType: _datatype_sql,
             exp.Date: _date_sql,
@@ -518,9 +549,13 @@ class DuckDB(Dialect):
             exp.IntDiv: lambda self, e: self.binary(e, "//"),
             exp.IsInf: rename_func("ISINF"),
             exp.IsNan: rename_func("ISNAN"),
+            exp.JSONBExists: rename_func("JSON_EXISTS"),
             exp.JSONExtract: _arrow_json_extract_sql,
+            exp.JSONExtractArray: _json_extract_value_array_sql,
             exp.JSONExtractScalar: _arrow_json_extract_sql,
             exp.JSONFormat: _json_format_sql,
+            exp.JSONValueArray: _json_extract_value_array_sql,
+            exp.Lateral: explode_to_unnest_sql,
             exp.LogicalOr: rename_func("BOOL_OR"),
             exp.LogicalAnd: rename_func("BOOL_AND"),
             exp.MD5Digest: lambda self, e: self.func("UNHEX", self.func("MD5", e.this)),
@@ -535,7 +570,6 @@ class DuckDB(Dialect):
             # DuckDB doesn't allow qualified columns inside of PIVOT expressions.
             # See: https://github.com/duckdb/duckdb/blob/671faf92411182f81dce42ac43de8bfb05d9909e/src/planner/binder/tableref/bind_pivot.cpp#L61-L62
             exp.Pivot: transforms.preprocess([transforms.unqualify_columns]),
-            exp.RegexpExtract: regexp_extract_sql,
             exp.RegexpReplace: lambda self, e: self.func(
                 "REGEXP_REPLACE",
                 e.this,
@@ -549,6 +583,7 @@ class DuckDB(Dialect):
             exp.ReturnsProperty: lambda self, e: "TABLE" if isinstance(e.this, exp.Schema) else "",
             exp.Rand: rename_func("RANDOM"),
             exp.SafeDivide: no_safe_divide_sql,
+            exp.SHA: rename_func("SHA1"),
             exp.SHA2: sha256_sql,
             exp.Split: rename_func("STR_SPLIT"),
             exp.SortArray: _sort_array_sql,
@@ -593,6 +628,9 @@ class DuckDB(Dialect):
             exp.VariancePop: rename_func("VAR_POP"),
             exp.WeekOfYear: rename_func("WEEKOFYEAR"),
             exp.Xor: bool_xor_sql,
+            exp.Levenshtein: unsupported_args("ins_cost", "del_cost", "sub_cost", "max_dist")(
+                rename_func("LEVENSHTEIN")
+            ),
         }
 
         SUPPORTED_JSON_PATH_PARTS = {
@@ -927,3 +965,29 @@ class DuckDB(Dialect):
                 return super().ignorenulls_sql(expression)
 
             return self.sql(expression, "this")
+
+        def arraytostring_sql(self, expression: exp.ArrayToString) -> str:
+            this = self.sql(expression, "this")
+            null_text = self.sql(expression, "null")
+
+            if null_text:
+                this = f"LIST_TRANSFORM({this}, x -> COALESCE(x, {null_text}))"
+
+            return self.func("ARRAY_TO_STRING", this, expression.expression)
+
+        @unsupported_args("position", "occurrence")
+        def regexpextract_sql(self, expression: exp.RegexpExtract) -> str:
+            group = expression.args.get("group")
+            params = expression.args.get("parameters")
+
+            # Do not render group if there is no following argument,
+            # and it's the default value for this dialect
+            if (
+                not params
+                and group
+                and group.name == str(self.dialect.REGEXP_EXTRACT_DEFAULT_GROUP)
+            ):
+                group = None
+            return self.func(
+                "REGEXP_EXTRACT", expression.this, expression.expression, group, params
+            )

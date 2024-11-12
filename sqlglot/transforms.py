@@ -3,9 +3,12 @@ from __future__ import annotations
 import typing as t
 
 from sqlglot import expressions as exp
+from sqlglot.errors import UnsupportedError
 from sqlglot.helper import find_new_name, name_sequence
 
+
 if t.TYPE_CHECKING:
+    from sqlglot._typing import E
     from sqlglot.generator import Generator
 
 
@@ -27,9 +30,12 @@ def preprocess(
     def _to_sql(self, expression: exp.Expression) -> str:
         expression_type = type(expression)
 
-        expression = transforms[0](expression)
-        for transform in transforms[1:]:
-            expression = transform(expression)
+        try:
+            expression = transforms[0](expression)
+            for transform in transforms[1:]:
+                expression = transform(expression)
+        except UnsupportedError as unsupported_error:
+            self.unsupported(str(unsupported_error))
 
         _sql_handler = getattr(self, expression.key + "_sql", None)
         if _sql_handler:
@@ -296,19 +302,45 @@ def unqualify_unnest(expression: exp.Expression) -> exp.Expression:
     return expression
 
 
-def unnest_to_explode(expression: exp.Expression) -> exp.Expression:
+def unnest_to_explode(
+    expression: exp.Expression,
+    unnest_using_arrays_zip: bool = True,
+) -> exp.Expression:
     """Convert cross join unnest into lateral view explode."""
+
+    def _unnest_zip_exprs(
+        u: exp.Unnest, unnest_exprs: t.List[exp.Expression], has_multi_expr: bool
+    ) -> t.List[exp.Expression]:
+        if has_multi_expr:
+            if not unnest_using_arrays_zip:
+                raise UnsupportedError("Cannot transpile UNNEST with multiple input arrays")
+
+            # Use INLINE(ARRAYS_ZIP(...)) for multiple expressions
+            zip_exprs: t.List[exp.Expression] = [
+                exp.Anonymous(this="ARRAYS_ZIP", expressions=unnest_exprs)
+            ]
+            u.set("expressions", zip_exprs)
+            return zip_exprs
+        return unnest_exprs
+
+    def _udtf_type(u: exp.Unnest, has_multi_expr: bool) -> t.Type[exp.Func]:
+        if u.args.get("offset"):
+            return exp.Posexplode
+        return exp.Inline if has_multi_expr else exp.Explode
+
     if isinstance(expression, exp.Select):
         from_ = expression.args.get("from")
 
         if from_ and isinstance(from_.this, exp.Unnest):
             unnest = from_.this
             alias = unnest.args.get("alias")
-            udtf = exp.Posexplode if unnest.args.get("offset") else exp.Explode
-            this, *expressions = unnest.expressions
+            exprs = unnest.expressions
+            has_multi_expr = len(exprs) > 1
+            this, *expressions = _unnest_zip_exprs(unnest, exprs, has_multi_expr)
+
             unnest.replace(
                 exp.Table(
-                    this=udtf(
+                    this=_udtf_type(unnest, has_multi_expr)(
                         this=this,
                         expressions=expressions,
                     ),
@@ -316,7 +348,8 @@ def unnest_to_explode(expression: exp.Expression) -> exp.Expression:
                 )
             )
 
-        for join in expression.args.get("joins") or []:
+        joins = expression.args.get("joins") or []
+        for join in list(joins):
             join_expr = join.this
 
             is_lateral = isinstance(join_expr, exp.Lateral)
@@ -324,18 +357,38 @@ def unnest_to_explode(expression: exp.Expression) -> exp.Expression:
             unnest = join_expr.this if is_lateral else join_expr
 
             if isinstance(unnest, exp.Unnest):
-                alias = join_expr.args.get("alias") if is_lateral else unnest.args.get("alias")
-                udtf = exp.Posexplode if unnest.args.get("offset") else exp.Explode
+                if is_lateral:
+                    alias = join_expr.args.get("alias")
+                else:
+                    alias = unnest.args.get("alias")
+                exprs = unnest.expressions
+                # The number of unnest.expressions will be changed by _unnest_zip_exprs, we need to record it here
+                has_multi_expr = len(exprs) > 1
+                exprs = _unnest_zip_exprs(unnest, exprs, has_multi_expr)
 
-                expression.args["joins"].remove(join)
+                joins.remove(join)
 
-                for e, column in zip(unnest.expressions, alias.columns if alias else []):
+                alias_cols = alias.columns if alias else []
+
+                # # Handle UNNEST to LATERAL VIEW EXPLODE: Exception is raised when there are 0 or > 2 aliases
+                # Spark LATERAL VIEW EXPLODE requires single alias for array/struct and two for Map type column unlike unnest in trino/presto which can take an arbitrary amount.
+                # Refs: https://spark.apache.org/docs/latest/sql-ref-syntax-qry-select-lateral-view.html
+
+                if not has_multi_expr and len(alias_cols) not in (1, 2):
+                    raise UnsupportedError(
+                        "CROSS JOIN UNNEST to LATERAL VIEW EXPLODE transformation requires explicit column aliases"
+                    )
+
+                for e, column in zip(exprs, alias_cols):
                     expression.append(
                         "laterals",
                         exp.Lateral(
-                            this=udtf(this=e),
+                            this=_udtf_type(unnest, has_multi_expr)(this=e),
                             view=True,
-                            alias=exp.TableAlias(this=alias.this, columns=[column]),  # type: ignore
+                            alias=exp.TableAlias(
+                                this=alias.this,  # type: ignore
+                                columns=alias_cols,
+                            ),
                         ),
                     )
 
@@ -587,16 +640,28 @@ def eliminate_full_outer_join(expression: exp.Expression) -> exp.Expression:
             expression_copy = expression.copy()
             expression.set("limit", None)
             index, full_outer_join = full_outer_joins[0]
-            full_outer_join.set("side", "left")
-            expression_copy.args["joins"][index].set("side", "right")
-            expression_copy.args.pop("with", None)  # remove CTEs from RIGHT side
 
-            return exp.union(expression, expression_copy, copy=False)
+            tables = (expression.args["from"].alias_or_name, full_outer_join.alias_or_name)
+            join_conditions = full_outer_join.args.get("on") or exp.and_(
+                *[
+                    exp.column(col, tables[0]).eq(exp.column(col, tables[1]))
+                    for col in full_outer_join.args.get("using")
+                ]
+            )
+
+            full_outer_join.set("side", "left")
+            anti_join_clause = exp.select("1").from_(expression.args["from"]).where(join_conditions)
+            expression_copy.args["joins"][index].set("side", "right")
+            expression_copy = expression_copy.where(exp.Exists(this=anti_join_clause).not_())
+            expression_copy.args.pop("with", None)  # remove CTEs from RIGHT side
+            expression.args.pop("order", None)  # remove order by from LEFT side
+
+            return exp.union(expression, expression_copy, copy=False, distinct=False)
 
     return expression
 
 
-def move_ctes_to_top_level(expression: exp.Expression) -> exp.Expression:
+def move_ctes_to_top_level(expression: E) -> E:
     """
     Some dialects (e.g. Hive, T-SQL, Spark prior to version 3) only allow CTEs to be
     defined at the top-level, so for example queries like:
@@ -858,5 +923,32 @@ def eliminate_join_marks(expression: exp.Expression) -> exp.Expression:
 
         if not where.this:
             where.pop()
+
+    return expression
+
+
+def any_to_exists(expression: exp.Expression) -> exp.Expression:
+    """
+    Transform ANY operator to Spark's EXISTS
+
+    For example,
+        - Postgres: SELECT * FROM tbl WHERE 5 > ANY(tbl.col)
+        - Spark: SELECT * FROM tbl WHERE EXISTS(tbl.col, x -> x < 5)
+
+    Both ANY and EXISTS accept queries but currently only array expressions are supported for this
+    transformation
+    """
+    if isinstance(expression, exp.Select):
+        for any in expression.find_all(exp.Any):
+            this = any.this
+            if isinstance(this, exp.Query):
+                continue
+
+            binop = any.parent
+            if isinstance(binop, exp.Binary):
+                lambda_arg = exp.to_identifier("x")
+                any.replace(lambda_arg)
+                lambda_expr = exp.Lambda(this=binop.copy(), expressions=[lambda_arg])
+                binop.replace(exp.Exists(this=this.unnest(), expression=lambda_expr))
 
     return expression

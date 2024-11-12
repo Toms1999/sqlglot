@@ -14,6 +14,26 @@ SELECT 1 FROM x.y.z AS z;
 SELECT 1 FROM x.y.z AS z;
 SELECT 1 FROM x.y.z AS z;
 
+# title: only information schema
+# dialect: bigquery
+SELECT * FROM information_schema.tables;
+SELECT * FROM c.db.`information_schema.tables` AS tables;
+
+# title: information schema with db
+# dialect: bigquery
+SELECT * FROM y.information_schema.tables;
+SELECT * FROM c.y.`information_schema.tables` AS tables;
+
+# title: information schema with db, catalog
+# dialect: bigquery
+SELECT * FROM x.y.information_schema.tables;
+SELECT * FROM x.y.`information_schema.tables` AS tables;
+
+# title: information schema with db, catalog, alias
+# dialect: bigquery
+SELECT * FROM x.y.information_schema.tables AS z;
+SELECT * FROM x.y.`information_schema.tables` AS z;
+
 # title: redshift unnest syntax, z.a should be a column, not a table
 # dialect: redshift
 SELECT 1 FROM y.z AS z, z.a;
@@ -184,3 +204,6 @@ COPY INTO (SELECT * FROM c.db.x AS x) TO 'data' WITH (FORMAT 'CSV');
 # title: tablesample
 SELECT 1 FROM x TABLESAMPLE SYSTEM (10 PERCENT) CROSS JOIN y TABLESAMPLE SYSTEM (10 PERCENT);
 SELECT 1 FROM c.db.x AS x TABLESAMPLE SYSTEM (10 PERCENT) CROSS JOIN c.db.y AS y TABLESAMPLE SYSTEM (10 PERCENT);
+
+WITH cte_tbl AS (SELECT 1 AS col2) UPDATE y SET col1 = (SELECT * FROM x) WHERE EXISTS(SELECT 1 FROM cte_tbl);
+WITH cte_tbl AS (SELECT 1 AS col2) UPDATE c.db.y SET col1 = (SELECT * FROM c.db.x AS x) WHERE EXISTS(SELECT 1 FROM cte_tbl AS cte_tbl);
